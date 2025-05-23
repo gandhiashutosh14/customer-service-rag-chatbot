@@ -7,3 +7,4 @@ customer_venv/
 
 # OS files
 .DS_Store
+complaints.db
