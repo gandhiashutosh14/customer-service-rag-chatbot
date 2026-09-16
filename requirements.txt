@@ -1,1 +1,14 @@
-streamlit==1.41.1 langchain==0.3.0 langchain-community==0.3.0 groq==0.13.1 sentence-transformers==3.0.1 faiss-cpu==1.8.0 fastapi==0.115.0 uvicorn==0.30.6 pypdf2==3.0.1 python-dotenv==1.0.1 email-validator==2.2.0
+streamlit>=1.41
+langchain>=0.3,<0.4
+langchain-community>=0.3,<0.4
+langchain-huggingface>=0.1
+langchain-groq>=0.2
+groq
+sentence-transformers>=3.0
+faiss-cpu
+fastapi>=0.115
+uvicorn[standard]
+pypdf
+python-dotenv
+email-validator
+requests

@@ -1,267 +1,193 @@
-import streamlit as st
-import os
-import requests
-import re
+"""
+Streamlit chat front end: RAG answers over the knowledge base, plus a
+slot-filling flow that files complaints through the FastAPI service and a
+retrieval flow that fetches them by ID. Deterministic logic lives in
+chat_logic.py; this file owns the UI and the LLM calls.
+"""
 import logging
+import os
+
+import requests
+import streamlit as st
 from dotenv import load_dotenv
-from langchain_community.document_loaders import PyPDFLoader
+from langchain.chains import RetrievalQA
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
-from langchain.chains import RetrievalQA
-from datetime import datetime
+from langchain_huggingface import HuggingFaceEmbeddings
 
-# ─── Logging setup ─────────────────────────────────────────
-logging.basicConfig(level=logging.DEBUG)
+from chat_logic import (
+    SlotFiller,
+    build_intent_prompt,
+    build_issue_brief_prompt,
+    format_complaint,
+    normalise_intent,
+    parse_complaint_id,
+)
+
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ─── Environment & API URLs ─────────────────────────────────
+# ─── Configuration ─────────────────────────────────────────
 load_dotenv()
-API_URL      = "http://127.0.0.1:8000"
+API_URL = os.getenv("COMPLAINTS_API_URL", "http://127.0.0.1:8000")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+KNOWLEDGE_DIR = os.getenv("KNOWLEDGE_DIR", "knowledge_base")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
-# ─── LLM & Embeddings ──────────────────────────────────────
-llm      = ChatGroq(api_key=GROQ_API_KEY, model="llama-3.1-8b-instant")
-embedder = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+st.set_page_config(page_title="Customer Service Chatbot", page_icon="💬")
 
-# ─── Build RAG Retriever ───────────────────────────────────
-def init_rag():
+if not GROQ_API_KEY:
+    st.error("GROQ_API_KEY is not set. Copy .env.example to .env and add your key.")
+    st.stop()
+
+llm = ChatGroq(api_key=GROQ_API_KEY, model=GROQ_MODEL)
+
+
+# ─── RAG chain (built once per process) ────────────────────
+@st.cache_resource(show_spinner="Indexing knowledge base...")
+def build_rag_chain(knowledge_dir: str, embedding_model: str):
     docs = []
-    for fname in os.listdir("knowledge_base"):
-        if fname.endswith(".pdf"):
-            docs.extend(PyPDFLoader(os.path.join("knowledge_base", fname)).load())
-    splitter   = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    chunks     = splitter.split_documents(docs)
-    db         = FAISS.from_documents(chunks, embedder)
-    retriever  = db.as_retriever()
-    retriever.search_kwargs = {"k": 5}
+    for fname in sorted(os.listdir(knowledge_dir)):
+        if fname.lower().endswith(".pdf"):
+            docs.extend(PyPDFLoader(os.path.join(knowledge_dir, fname)).load())
+    if not docs:
+        raise RuntimeError(f"No PDF files found in {knowledge_dir}/")
+    chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_documents(docs)
+    embedder = HuggingFaceEmbeddings(model_name=embedding_model)
+    retriever = FAISS.from_documents(chunks, embedder).as_retriever(search_kwargs={"k": 5})
     return RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=retriever)
 
-# ─── Few-shot intent classification ─────────────────────────
+
+# ─── LLM helpers ───────────────────────────────────────────
 def classify_intent(user_text: str) -> str:
-    prompt = f"""
-You are an intent classifier. Classify into file_complaint, retrieve_complaint, or general_query.
-Respond exactly with the label.
-
-Examples:
-User: I want to file a complaint about a delayed delivery.
-Intent: file_complaint
-
-User: Show details for complaint ABC123.
-Intent: retrieve_complaint
-
-User: mujhe ek complaint hai galat order ke liye
-Intent: file_complaint
-
-User: What time do you close?
-Intent: general_query
-
-Now classify:
-User: {user_text}
-Intent:
-"""
     try:
-        res = llm.invoke(prompt).content.strip().splitlines()[0]
-        return res if res in {"file_complaint","retrieve_complaint","general_query"} else "general_query"
-    except Exception as e:
-        logger.error("Intent classification failed: %s", e)
+        return normalise_intent(llm.invoke(build_intent_prompt(user_text)).content)
+    except Exception as exc:  # noqa: BLE001 - degrade to RAG rather than crash the chat
+        logger.error("Intent classification failed: %s", exc)
         return "general_query"
 
-# ─── Extract brief complaint topic ─────────────────────────
+
 def extract_issue_brief(user_text: str) -> str:
-    prompt = f"""
-Extract topic (max 3 words) of this complaint:
-"{user_text}"
-"""
     try:
-        return llm.invoke(prompt).content.strip() or "your issue"
-    except:
+        return llm.invoke(build_issue_brief_prompt(user_text)).content.strip() or "your issue"
+    except Exception:  # noqa: BLE001
         return "your issue"
 
-# ─── Session state init ────────────────────────────────────
-if "history" not in st.session_state:
-    st.session_state.history = [{
-        "role":"assistant",
-        "content":"Hello! How can I assist you today? You can ask questions or file a complaint."
-    }]
-if "rag_chain" not in st.session_state:
-    st.session_state.rag_chain = init_rag()
-for var in ("complaint_mode","complaint_data","current_field","pending_action","last_complaint_id","issue_brief"):
-    if var not in st.session_state:
-        st.session_state[var] = False if var=="complaint_mode" else {} if var=="complaint_data" else None
 
-# ─── Complaint flow config ────────────────────────────────
-FIELDS = ["name","phone_number","email","complaint_details"]
-PROMPTS = {
-    "name":              "I'm sorry to hear about {issue}. Please provide your name.",
-    "phone_number":      "Thank you, {name}. What is your phone number?",
-    "email":             "Got it. Please provide your email address.",
-    "complaint_details": "Thanks. Can you share more details about {issue}?"
-}
+# ─── Complaint API helpers ─────────────────────────────────
+def create_complaint(payload: dict) -> str:
+    r = requests.post(f"{API_URL}/complaints", json=payload, timeout=10)
+    r.raise_for_status()
+    return r.json()["complaint_id"]
 
-# ─── Validators + keywords ─────────────────────────────────
-def valid_name(n):  return bool(re.fullmatch(r"[A-Za-z ]{3,50}", n))
-def valid_phone(p): return bool(re.fullmatch(r"\+?\d{10,15}", p))
-def valid_email(e): return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", e))
-COMPLAINT_KEYWORDS = ["complaint","order","delivery","issue","late","wrong"]
 
-# ─── Timestamp formatter ───────────────────────────────────
-def format_ts(ts):
-    try:
-        return datetime.fromisoformat(ts).strftime("%B %d, %Y at %I:%M %p")
-    except:
-        return ts
+def fetch_complaint(complaint_id: str) -> str:
+    r = requests.get(f"{API_URL}/complaints/{complaint_id}", timeout=10)
+    if r.status_code == 404:
+        return f"No complaint found with ID {complaint_id}."
+    r.raise_for_status()
+    return format_complaint(r.json())
 
-# ─── UI header & history ───────────────────────────────────
+
+# ─── Session state ─────────────────────────────────────────
+ss = st.session_state
+ss.setdefault("history", [{
+    "role": "assistant",
+    "content": "Hello! How can I assist you today? You can ask questions or file a complaint.",
+}])
+ss.setdefault("filler", None)          # SlotFiller while a complaint is being collected
+ss.setdefault("pending_retrieve", None)  # complaint ID awaiting yes/no while a complaint is in progress
+ss.setdefault("last_complaint_id", None)
+
+try:
+    rag_chain = build_rag_chain(KNOWLEDGE_DIR, EMBEDDING_MODEL)
+except Exception as exc:  # noqa: BLE001
+    st.error(f"Could not build the knowledge base: {exc}")
+    st.stop()
+
+
+def say(text: str) -> None:
+    ss.history.append({"role": "assistant", "content": text})
+    with st.chat_message("assistant"):
+        st.markdown(text)
+
+
+# ─── UI ────────────────────────────────────────────────────
 st.title("Customer Service Chatbot")
-for msg in st.session_state.history:
+for msg in ss.history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# ─── Cancel button shows immediately once complaint_mode is True ───
-if st.session_state.complaint_mode:
-    if st.button("Cancel Complaint"):
-        st.session_state.complaint_mode = False
-        st.session_state.complaint_data.clear()
-        st.session_state.current_field = None
-        st.session_state.pending_action = None
-        msg = "Complaint process canceled."
-        st.session_state.history.append({"role":"assistant","content":msg})
-        with st.chat_message("assistant"):
-            st.markdown(msg)
+if ss.filler is not None and st.button("Cancel Complaint"):
+    ss.filler = None
+    ss.pending_retrieve = None
+    say("Complaint process canceled.")
 
-# ─── Main interaction ──────────────────────────────────────
 if user_input := st.chat_input("Your message..."):
     usr = user_input.strip()
-    st.session_state.history.append({"role":"user","content":usr})
+    ss.history.append({"role": "user", "content": usr})
     with st.chat_message("user"):
         st.markdown(usr)
 
-    # 1️⃣ Slot-filling priority
-    if (st.session_state.complaint_mode and
-        st.session_state.current_field is not None and
-        not st.session_state.pending_action):
-
-        fld   = FIELDS[st.session_state.current_field]
-        name  = st.session_state.complaint_data.get("name","")
-        issue = st.session_state.issue_brief or "your issue"
-
-        if fld == "name":
-            if not valid_name(usr) or any(kw in usr.lower() for kw in COMPLAINT_KEYWORDS):
-                response = "The name you provided isn’t valid. Please enter your full name (letters and spaces only)."
-            else:
-                st.session_state.complaint_data[fld] = usr
-                st.session_state.current_field += 1
-                response = PROMPTS["phone_number"].format(name=usr,issue=issue)
-
-        elif fld == "phone_number":
-            if not valid_phone(usr):
-                response = f"Invalid phone number: '{usr}'. Please enter a valid 10–15 digit phone (optional '+' prefix)."
-            else:
-                st.session_state.complaint_data[fld] = usr
-                st.session_state.current_field += 1
-                response = PROMPTS["email"].format(name=name,issue=issue)
-
-        elif fld == "email":
-            if not valid_email(usr):
-                response = f"Invalid email address: '{usr}'. Please enter a valid address (example: user@example.com)."
-            else:
-                st.session_state.complaint_data[fld] = usr
-                st.session_state.current_field += 1
-                response = PROMPTS["complaint_details"].format(name=name,issue=issue)
-
-        else:
-            st.session_state.complaint_data[fld] = usr
+    # 1. Pending yes/no: abandon the in-progress complaint to retrieve another?
+    if ss.pending_retrieve:
+        cid = ss.pending_retrieve
+        ss.pending_retrieve = None
+        if usr.lower() in ("yes", "y"):
+            ss.filler = None
             try:
-                r = requests.post(f"{API_URL}/complaints", json=st.session_state.complaint_data)
-                r.raise_for_status()
-                cid = r.json()["complaint_id"]
-                response = f"Your complaint has been registered with ID: {cid}. We'll get back to you soon."
-                st.session_state.last_complaint_id = cid
-            except Exception as e:
-                response = f"Error creating complaint: {e}"
-            st.session_state.complaint_mode = False
-            st.session_state.current_field = None
-            st.session_state.complaint_data.clear()
-
-        with st.chat_message("assistant"):
-            st.markdown(response)
-        st.session_state.history.append({"role":"assistant","content":response})
+                say(fetch_complaint(cid))
+            except Exception as exc:  # noqa: BLE001
+                say(f"Error retrieving complaint: {exc}")
+        else:
+            say(f"Okay, continuing your complaint. {ss.filler.current_prompt()}")
         st.stop()
 
-    # 2️⃣ Pending confirmation (in-progress → retrieve)
-    if st.session_state.pending_action:
-        act = st.session_state.pending_action
-        if usr.lower() in ("yes","y") and act.get("type") == "retrieve":
-            cid = act["id"]
-            st.session_state.pending_action = None
-            try:
-                r = requests.get(f"{API_URL}/complaints/{cid}")
-                r.raise_for_status()
-                d = r.json()
-                response = (
-                    f"**Complaint ID**: {d['complaint_id']}  \n"
-                    f"**Name**: {d['name']}              \n"
-                    f"**Phone**: {d['phone_number']}    \n"
-                    f"**Email**: {d['email']}           \n"
-                    f"**Details**: {d['complaint_details']}\n"
-                    f"**Created At**: {format_ts(d['created_at'])}"
-                )
-            except Exception as e:
-                response = f"Error retrieving complaint: {e}"
-        else:
-            st.session_state.pending_action = None
-            st.session_state.complaint_mode = True
-            st.session_state.current_field = 0
-            response = PROMPTS["name"].format(issue=st.session_state.issue_brief)
+    # 2. Slot filling takes priority while a complaint is in progress
+    if ss.filler is not None:
+        cid = parse_complaint_id(usr)
+        if cid and ss.filler.current_field != "complaint_details":
+            ss.pending_retrieve = cid
+            say("You have an in-progress complaint. Cancel it and retrieve the other one? (yes/no)")
+            st.stop()
 
-        with st.chat_message("assistant"):
-            st.markdown(response)
-        st.session_state.history.append({"role":"assistant","content":response})
+        accepted, reply = ss.filler.submit(usr)
+        if not accepted:
+            say(reply)
+        elif ss.filler.complete:
+            try:
+                complaint_id = create_complaint(ss.filler.data)
+                ss.last_complaint_id = complaint_id
+                say(f"Your complaint has been registered with ID: {complaint_id}. We'll get back to you soon.")
+            except Exception as exc:  # noqa: BLE001
+                say(f"Error creating complaint: {exc}")
+            ss.filler = None
+        else:
+            say(reply)
         st.stop()
 
-    # 3️⃣ Intent detection
+    # 3. Fresh message: classify intent
     intent = classify_intent(usr)
     if intent == "file_complaint":
-        st.session_state.issue_brief = extract_issue_brief(usr)
-        st.session_state.complaint_mode = True
-        st.session_state.current_field = 0
-        response = PROMPTS["name"].format(issue=st.session_state.issue_brief)
+        ss.filler = SlotFiller(issue=extract_issue_brief(usr))
+        say(ss.filler.start())
 
     elif intent == "retrieve_complaint":
-        m = re.search(r"[a-f0-9\\-]{36}", usr)
-        if m:
-            cid = m.group(0)
-            if st.session_state.complaint_mode:
-                st.session_state.pending_action = {"type":"retrieve","id":cid}
-                response = "You have an in-progress complaint. Cancel it and retrieve? (yes/no)"
-            else:
-                try:
-                    r = requests.get(f"{API_URL}/complaints/{cid}")
-                    r.raise_for_status()
-                    d = r.json()
-                    response = (
-                        f"**Complaint ID**: {d['complaint_id']}  \n"
-                        f"**Name**: {d['name']}              \n"
-                        f"**Phone**: {d['phone_number']}    \n"
-                        f"**Email**: {d['email']}           \n"
-                        f"**Details**: {d['complaint_details']}\n"
-                        f"**Created At**: {format_ts(d['created_at'])}"
-                    )
-                except Exception as e:
-                    response = f"Error retrieving complaint: {e}"
+        cid = parse_complaint_id(usr) or ss.last_complaint_id
+        if cid:
+            try:
+                say(fetch_complaint(cid))
+            except Exception as exc:  # noqa: BLE001
+                say(f"Error retrieving complaint: {exc}")
         else:
-            response = "Please provide a valid complaint ID."
+            say("Please provide a valid complaint ID.")
 
     else:
-        # RAG fallback
         try:
-            rag = st.session_state.rag_chain.invoke({"query":usr})
-            response = rag.get("result","Sorry, I couldn't find an answer.")
-        except Exception as e:
-            response = f"RAG error: {e}"
-
-    with st.chat_message("assistant"):
-        st.markdown(response)
-    st.session_state.history.append({"role":"assistant","content":response})
+            result = rag_chain.invoke({"query": usr})
+            say(result.get("result") or "Sorry, I couldn't find an answer.")
+        except Exception as exc:  # noqa: BLE001
+            say(f"RAG error: {exc}")
