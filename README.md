@@ -1,118 +1,114 @@
 # Customer Service RAG Chatbot
 
-This repository contains a Retrieval-Augmented Generation (RAG) chatbot built with Streamlit and FastAPI. The chatbot can:
+**A support chatbot that answers policy questions from a PDF knowledge base with retrieval-augmented generation, and files and retrieves customer complaints through a validated slot-filling flow backed by a FastAPI service.**
 
-* Answer general questions by retrieving context from a PDF-based knowledge base
-* Collect customer complaint details (name, phone number, email, complaint description)
-* Create a complaint record via a REST API and return a unique complaint ID
-* Retrieve and display complaint details when given a valid complaint ID
+![Python](https://img.shields.io/badge/python-3.11-blue) ![License](https://img.shields.io/badge/license-MIT-green) [![tests](https://github.com/gandhiashutosh14/customer-service-rag-chatbot/actions/workflows/ci.yml/badge.svg)](https://github.com/gandhiashutosh14/customer-service-rag-chatbot/actions/workflows/ci.yml) ![Status](https://img.shields.io/badge/status-working%20prototype-orange)
 
-## Features
+![Chat UI](docs/screenshot.png)
 
-1. Contextual responses driven by a vector store (FAISS) over PDF documents
-2. Multi-step slot filling for complaint creation with immediate validation for name, phone, and email
-3. FastAPI backend with two endpoints:
+---
 
-   * `POST /complaints` to create a new complaint
-   * `GET /complaints/{complaint_id}` to fetch an existing complaint
-4. Real-time retrieval of complaint records in the chatflow
-5. Human-friendly timestamp formatting
+## What it is, and why
 
-## Tech Stack
+Most "chat with your PDF" demos stop at question answering. Support conversations also need to *do* things: take a complaint, validate the contact details, hand back a ticket ID, and look the ticket up later. This project combines both in one chat surface:
 
-* Front end: Streamlit
-* Backend: FastAPI, SQLite
-* Vector store: FAISS
-* LLM inference: Groq Cloud (via OpenAI-compatible endpoint) or any OpenAI-compatible model
-* Embeddings: sentence-transformers/all-MiniLM-L6-v2
-* Language: Python 3.9+
+- **Ask a question** and the answer is grounded in the PDFs under `knowledge_base/` via FAISS retrieval and a Groq-hosted Llama model.
+- **Say "I want to file a complaint"** and the bot switches into a deterministic slot-filling flow: name, phone, email, details, each validated immediately, then `POST /complaints` returns a UUID.
+- **Say "show complaint <id>"** and it fetches the record from the API and renders it.
 
-## Prerequisites
+An LLM decides the *intent*; plain Python decides everything after that. That split is deliberate: the parts that must be correct (validation, state, API calls) are testable and never hallucinate.
 
-* Python 3.9 or newer
-* [poetry](https://python-poetry.org/) or `pip` for dependency management
-* A Groq Cloud API key (or OpenAI API key if using the OpenAI-compatible endpoint)
+## Architecture
 
-## Setup
-
-1. Clone the repository
-
-   ```bash
-   git clone https://github.com/your-username/customer-service-rag-chatbot.git
-   cd customer-service-rag-chatbot
-   ```
-
-2. Install dependencies
-
-   Using pip:
-
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-   Or using poetry:
-
-   ```bash
-   poetry install
-   ```
-
-3. Create a `.env` file in the project root and set your API key:
-
-   ```text
-   GROQ_API_KEY=your_groq_api_key_here
-   ```
-
-4. Place your sample PDF files in the `knowledge_base/` folder. These files will be loaded into FAISS.
-
-## Running the Application
-
-1. Start the FastAPI backend:
-
-   ```bash
-   uvicorn api:app --reload
-   ```
-
-2. In a new terminal, launch the Streamlit front end:
-
-   ```bash
-   streamlit run app.py
-   ```
-
-3. Open your browser to `http://localhost:8501` to interact with the chatbot.
-
-## Usage
-
-* To ask a general question, just type it in the chat box.
-* To file a new complaint, start with a phrase like "I want to file a complaint" or "register an issue". The bot will prompt you for missing details one by one.
-* To retrieve an existing complaint, type "show details for complaint \<complaint\_id>" or any similar phrase. The bot accepts variations like "fetch complaint", "view complaint status", etc.
-
-## Project Structure
-
-```
-├── api.py           # FastAPI complaint service
-├── app.py           # Streamlit chat interface
-├── knowledge_base/  # PDF files used for RAG
-├── complaints.db    # SQLite database (auto-generated)
-├── requirements.txt # Python dependencies
-├── README.md        # Project documentation
-└── .env             # API keys (not committed)
+```mermaid
+flowchart LR
+    U["User"] --> S["Streamlit chat<br/>app.py"]
+    S -->|"1. classify intent (few-shot)"| L["Groq · llama-3.1-8b-instant"]
+    S -->|"general_query"| R["RetrievalQA<br/>FAISS · MiniLM embeddings"]
+    R --> L
+    K[("knowledge_base/*.pdf")] --> R
+    S -->|"file_complaint"| F["SlotFiller state machine<br/>chat_logic.py · validators"]
+    F -->|"POST /complaints"| A["FastAPI · api.py"]
+    S -->|"retrieve_complaint · UUID parsed from text"| A
+    A --> D[("SQLite<br/>complaints.db")]
 ```
 
-## Testing & Validation
+## Key features
 
-* The chat front end immediately validates each field:
+- **Grounded answers**: PDFs are chunked (1000 chars, 200 overlap), embedded with `all-MiniLM-L6-v2`, indexed in FAISS, and the top 5 chunks are stuffed into the prompt. The index is built once per process with `st.cache_resource`.
+- **Few-shot intent routing** across `file_complaint`, `retrieve_complaint` and `general_query`, including a Hinglish example, with a safe fallback to RAG when the model's reply is not a known label.
+- **Slot filling as a state machine** (`SlotFiller` in `chat_logic.py`): validates names, 10-15 digit phone numbers and email addresses, rejects names that look like complaint text, re-asks on failure, and exposes the payload only when complete.
+- **Interrupt handling**: quoting a complaint ID mid-flow asks whether to abandon the current complaint; a cancel button is always visible while one is in progress.
+- **Complaint service** with Pydantic v2 validation (`422` on bad input), UUID IDs, ISO-8601 UTC timestamps, `404` on unknown IDs, and a configurable database path so tests run against a temp file.
 
-  * Names must use letters and spaces only
-  * Phone numbers must be 10 to 15 digits, optional leading plus sign
-  * Emails must follow the standard local\@domain format
-* Invalid IDs or malformed UUIDs result in a clear error message.
+## Tech stack
 
-## Next Steps
+Python 3.11 · Streamlit · FastAPI · SQLite · LangChain 0.3 (`RetrievalQA`, `PyPDFLoader`) · FAISS · `sentence-transformers/all-MiniLM-L6-v2` · Groq (`llama-3.1-8b-instant`) · pytest.
 
-* Add support for more languages by integrating a translation step before intent detection.
-* Extend slot-filling to allow mid-flow edits or field corrections.
-* Deploy on a cloud platform (Heroku, AWS, GCP) for live demo.
+## AI engineering highlights
+
+1. **Keep the LLM out of the parts that must not fail.** The model classifies intent and answers open questions. Field validation, conversation state and the API contract are ordinary code with 21 unit tests. A hallucinated phone number cannot reach the database.
+2. **Intent output is normalised, not trusted.** The classifier is asked to reply with a bare label; the first line of its reply is lower-cased and checked against the allowed set, and anything else routes to RAG. The tests pin that behaviour, including the case where the model echoes `Intent:`.
+3. **Testable API without touching real data.** The SQLite path is read from `COMPLAINTS_DB_PATH`, the connection is opened lazily, and the test fixture imports the app against a temporary file, so the suite runs in CI with no fixtures on disk.
+4. **Graceful degradation.** Every model call is wrapped: a failed intent call falls back to `general_query`, a failed brief extraction falls back to "your issue", and API errors are shown in chat rather than crashing the session.
+
+## Quick start
+
+```bash
+git clone https://github.com/gandhiashutosh14/customer-service-rag-chatbot.git
+cd customer-service-rag-chatbot
+python -m venv .venv
+# Windows: .venv\Scripts\activate    macOS/Linux: source .venv/bin/activate
+pip install -r requirements-dev.txt          # pulls torch for the embedding model
+cp .env.example .env                          # then put your Groq key in GROQ_API_KEY
+
+pytest -q                                     # 21 passed
+
+uvicorn api:app --port 8000                   # terminal 1: complaint service
+streamlit run app.py                          # terminal 2: chat UI at http://localhost:8501
+```
+
+`scripts/start.sh` runs both processes together, and the `Dockerfile` packages them (not built yet; see the development notes).
+
+### Try it
+
+- *"What is your refund policy?"* answers from `knowledge_base/sample_faq.pdf`.
+- *"I want to file a complaint about a late delivery"* starts the flow; try an invalid phone number to see validation.
+- *"Show details for complaint 62c14e4e-5890-4f83-b15b-abb9c6aa6170"* retrieves a record.
+
+The API alone, verified with curl on 2026-09-16:
+
+```
+POST /complaints  {name, phone_number, email, complaint_details}
+  -> 201 {"complaint_id": "62c14e4e-5890-4f83-b15b-abb9c6aa6170", "message": "Complaint created successfully"}
+GET  /complaints/62c14e4e-5890-4f83-b15b-abb9c6aa6170
+  -> 200 {..., "created_at": "2026-09-16T12:42:10.520858+00:00"}
+GET  /complaints/nope                      -> 404
+POST /complaints  (bad phone/email/blank)  -> 422
+```
+
+## Project layout
+
+```
+app.py              Streamlit UI, LLM calls, RAG chain, API client
+chat_logic.py       validators, UUID parsing, prompt builders, SlotFiller (no Streamlit, no LLM)
+api.py              FastAPI complaint service over SQLite
+knowledge_base/     PDFs indexed at startup (sample FAQ included)
+tests/              test_chat_logic.py (13) · test_api.py (8)
+scripts/start.sh    run API + UI together
+Dockerfile          both services in one image
+docs/               screenshot, development notes
+```
+
+## Status and scope
+
+Working prototype.
+
+- The knowledge base is a sample FAQ. Retrieval quality on your own documents depends on chunking and on the 8B model; there is no evaluation set.
+- Intent classification uses a few-shot prompt, not a trained classifier; unusual phrasings fall through to RAG.
+- Chat state is per browser session; complaints persist in SQLite but conversations do not.
+- The Streamlit UI was exercised during the refinement only up to rendering (no Groq key was used); the API and the state machine were verified end to end.
 
 ## License
 
-This project is released under the MIT License. Feel free to use and modify it for your needs.
+MIT. See [LICENSE](LICENSE).

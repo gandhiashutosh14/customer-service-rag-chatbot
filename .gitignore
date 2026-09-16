@@ -1,10 +1,24 @@
 # Python
 __pycache__/
 *.py[cod]
-*.env
+.pytest_cache/
+
+# Virtual environments
 .venv/
+venv/
 customer_venv/
 
-# OS files
-.DS_Store
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Runtime artifacts
 complaints.db
+*.db
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
